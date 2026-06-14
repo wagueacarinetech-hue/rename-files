@@ -1,7 +1,7 @@
 """
 rename_files.py — interactively remove a substring from filenames.
 
-Run it, point it at a folder or a single file, optionally narrow to
+Run it, drop in a folder or one-or-many files, optionally narrow to
 specific file types, type what you want stripped from the names,
 review the preview, confirm.
 
@@ -10,16 +10,18 @@ them (e.g. "lecture.pptx.pdf"), but works on any file type.
 
 Usage
 -----
-    python rename_files.py                  # asks for everything
-    python rename_files.py ./slides         # uses ./slides as the folder
-    python rename_files.py file.pdf         # rename a single file
-    python rename_files.py ./slides -r      # also include subfolders
+    python rename_files.py                          # asks for everything
+    python rename_files.py ./slides                 # scans the folder
+    python rename_files.py file.pdf                 # one file
+    python rename_files.py a.pdf b.pdf c.pdf        # several files
+    python rename_files.py ./slides -r              # also scan subfolders
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 from collections import Counter
 from pathlib import Path
@@ -63,11 +65,7 @@ def unique_path(target: Path, taken: set[Path]) -> Path:
 
 
 def find_files(root: Path, recursive: bool, extensions: set[str] | None) -> list[Path]:
-    """Return files in ``root``, optionally filtered to a set of extensions.
-
-    ``extensions`` should be lowercase and include the leading dot, e.g. {".pdf"}.
-    ``None`` means all files.
-    """
+    """Return files in ``root``, optionally filtered to a set of extensions."""
     pattern = "**/*" if recursive else "*"
     matches: list[Path] = []
     for p in root.glob(pattern):
@@ -95,12 +93,17 @@ def ask(prompt: str, default: str = "") -> str:
     return answer or default
 
 
-def strip_drag_quotes(s: str) -> str:
-    """Remove a matching pair of surrounding quotes (e.g. from macOS drag-drop)."""
-    s = s.strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        return s[1:-1]
-    return s
+def parse_paths(raw: str) -> list[Path]:
+    """Parse a line with one or more paths (handles quotes, escaped spaces, drag-drop)."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        # Unbalanced quotes — fall back to treating it as one literal path.
+        parts = [raw.strip("'\"")]
+    return [Path(p).expanduser() for p in parts if p]
 
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
@@ -140,31 +143,62 @@ def preview_changes(files: list[Path], pattern: str, all_occurrences: bool) -> l
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Interactively rename a file or folder of files by removing a substring.")
-    parser.add_argument("folder", nargs="?", type=Path, help="Folder to scan or a single file (you'll be prompted if omitted).")
-    parser.add_argument("--recursive", "-r", action="store_true", help="Also include files in subfolders (when folder is given).")
+    parser = argparse.ArgumentParser(description="Interactively rename one or more files (or a folder) by removing a substring.")
+    parser.add_argument("paths", nargs="*", type=Path, help="Folder, file, or multiple files (you'll be prompted if omitted).")
+    parser.add_argument("--recursive", "-r", action="store_true", help="Also include files in subfolders (when a folder is given).")
     args = parser.parse_args(argv)
 
-    # 1. Folder or file
-    target = args.folder
-    if target is None:
-        raw = ask("Folder or file to process", default=".")
-        target = Path(strip_drag_quotes(raw)).expanduser()
+    # 1. Collect paths (from CLI args or interactive prompt). Each can be a file or a folder.
+    paths: list[Path] = list(args.paths) if args.paths else []
+    if not paths:
+        raw = ask(
+            "Folder or files to process (drag and drop one or many; blank = current folder)",
+            default=".",
+        )
+        paths = parse_paths(raw)
 
-    if target.is_file():
-        files = [target]
-        all_files = files
-        print(f"\nProcessing 1 file: {target.name}")
-    elif target.is_dir():
-        all_files = find_files(target, args.recursive, extensions=None)
-        if not all_files:
-            scope = "(including subfolders)" if args.recursive else "(top level only)"
-            print(f"No files found in {target} {scope}.")
-            return 0
+    if not paths:
+        print("No paths given. Exiting.")
+        return 0
 
-        print(f"\nFound {len(all_files)} file(s) in {target}: {summarize_types(all_files)}")
+    # Validate and split into folder vs. file inputs.
+    folders: list[Path] = []
+    direct_files: list[Path] = []
+    for p in paths:
+        if p.is_dir():
+            folders.append(p)
+        elif p.is_file():
+            direct_files.append(p)
+        else:
+            print(f"warning: {p} is neither a file nor a folder — skipping", file=sys.stderr)
 
-        # 2. Optional extension filter (folders only)
+    if not folders and not direct_files:
+        print("Nothing valid to process. Exiting.")
+        return 1
+
+    # Expand folders into their contained files.
+    folder_files: list[Path] = []
+    for folder in folders:
+        folder_files.extend(find_files(folder, args.recursive, extensions=None))
+
+    all_files = sorted(set(direct_files + folder_files))
+    if not all_files:
+        print("No files found in the given folder(s).")
+        return 0
+
+    # Report what was picked up.
+    if len(paths) == 1 and folders:
+        print(f"\nFound {len(all_files)} file(s) in {folders[0]}: {summarize_types(all_files)}")
+    else:
+        bits = []
+        if direct_files:
+            bits.append(f"{len(direct_files)} dropped file(s)")
+        if folder_files:
+            bits.append(f"{len(folder_files)} from {len(folders)} folder(s)")
+        print(f"\nProcessing {len(all_files)} file(s) total ({', '.join(bits)}): {summarize_types(all_files)}")
+
+    # 2. Optional extension filter — only useful when folders were scanned.
+    if folders:
         ext_raw = ask(
             "\nLimit to specific extensions? (e.g. 'pdf' or 'pdf, docx' — blank = all)",
             default="",
@@ -179,8 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             files = all_files
     else:
-        print(f"error: {target} is neither a file nor a folder", file=sys.stderr)
-        return 1
+        files = all_files
 
     # 3. Substring to remove — keep looping until something matches or they quit.
     while True:
